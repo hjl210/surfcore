@@ -1180,6 +1180,18 @@ function loadConfig() {
   // 手写坏值（字符串/负数）也要收敛，不能把「没配」解释成「关闭」。
   cfg.socialV2.history = normalizeHistoryConfig(cfg.socialV2?.history);
 
+  // socialV2.adminTools：只对 private:<ownerQQ> 开放的能力（看 B站视频 / 逛插件市场 / 装插件）。
+  // 群里一律不给：QQ 群是不可信输入，给群友一个"装插件"的入口等于把本机执行权交出去。
+  cfg.socialV2.adminTools = {
+    enabled: true,
+    marketIndex: 'https://polang233.github.io/dsh-plugin-index/index.json',
+    installTimeoutMs: 300000,
+    maxComments: 12,
+    profile: process.env.DSH_PROFILE || 'desktop',
+    ...((cfg.socialV2?.adminTools && typeof cfg.socialV2.adminTools === 'object') ? cfg.socialV2.adminTools : {})
+  };
+
+
   // socialV2.initialPromptMaxChars：会话「初始提示词」的字数上限。config.json 是用户可编辑的，
   // 手工写进字符串/负数/超大值时要收敛到安全区间，否则要么保存接口永远报"过长"，要么等于没上限。
   {
@@ -2940,6 +2952,114 @@ async function main() {
       resized: image.resized,
       messageId: data?.message_id ?? null
     };
+  }
+
+  // ── 管理员工具（只认 private:<ownerQQ>）────────────────────────────────
+  // 群聊里一律拒绝：QQ 群是不可信输入，给群友「装插件 / 逛市场」的入口等于交出本机执行权。
+  function isOwnerSession(key) {
+    const owner = String(cfg.ownerQQ ?? '').trim();
+    return Boolean(owner) && String(key ?? '').trim() === `private:${owner}`;
+  }
+
+  const ADMIN_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+
+  async function fetchBiliVideoDetail(rawBvid) {
+    const bvid = String(rawBvid ?? '').trim().replace(/^.*?\b(BV[0-9A-Za-z]{10})\b.*$/i, '$1');
+    if (!/^BV[0-9A-Za-z]{10}$/.test(bvid)) throw new Error('BV 号格式不对（形如 BV1xx411c7mD；也可以直接发链接）');
+    const headers = { 'user-agent': ADMIN_UA, referer: 'https://www.bilibili.com/' };
+    const res = await fetch(`https://api.bilibili.com/x/web-interface/view?bvid=${bvid}`, { headers, signal: AbortSignal.timeout(12000) });
+    const j = await res.json().catch(() => ({}));
+    if (j?.code !== 0) throw new Error(`B站 view 接口返回 code=${j?.code ?? '?'}：${j?.message ?? ''}`);
+    const d = j.data ?? {};
+    return {
+      bvid,
+      aid: Number(d.aid) || 0,
+      title: String(d.title ?? '').trim(),
+      owner: String(d.owner?.name ?? '').trim(),
+      desc: String(d.desc ?? '').trim().slice(0, 500),
+      pic: String(d.pic ?? '').trim(),
+      duration: Number(d.duration) || 0,
+      pubdate: Number(d.pubdate) || 0,
+      stat: {
+        view: Number(d.stat?.view ?? 0) || 0,
+        danmaku: Number(d.stat?.danmaku ?? 0) || 0,
+        reply: Number(d.stat?.reply ?? 0) || 0,
+        like: Number(d.stat?.like ?? 0) || 0
+      }
+    };
+  }
+
+  async function fetchBiliTopComments(aid, limit = 10) {
+    if (!aid) return [];
+    const ps = Math.max(1, Math.min(20, Number(limit) || 10));
+    const headers = { 'user-agent': ADMIN_UA, referer: 'https://www.bilibili.com/' };
+    const res = await fetch(`https://api.bilibili.com/x/v2/reply?type=1&oid=${aid}&sort=2&ps=${ps}&pn=1`, { headers, signal: AbortSignal.timeout(12000) });
+    const j = await res.json().catch(() => ({}));
+    if (j?.code !== 0) return [];
+    return (j.data?.replies ?? []).slice(0, ps).map((r) => ({
+      user: String(r?.member?.uname ?? ''),
+      like: Number(r?.like) || 0,
+      message: String(r?.content?.message ?? '').slice(0, 200)
+    }));
+  }
+
+  async function readMarketIndex() {
+    const url = String(cfg.socialV2?.adminTools?.marketIndex || '').trim();
+    const res = await fetch(url, { headers: { 'user-agent': ADMIN_UA }, signal: AbortSignal.timeout(20000) });
+    if (!res.ok) throw new Error(`插件市场索引拉取失败：HTTP ${res.status}`);
+    const data = await res.json().catch(() => ({}));
+    const list = Array.isArray(data?.plugins) ? data.plugins : [];
+    return list.map((p) => ({
+      name: String(p?.name ?? ''),
+      title: typeof p?.title === 'string' ? p.title : String(p?.title?.zh ?? p?.title?.en ?? ''),
+      description: typeof p?.description === 'string' ? p.description : String(p?.description?.zh ?? p?.description?.en ?? ''),
+      version: String(p?.versions?.[0]?.version ?? ''),
+      repo: String(p?.repository?.url ?? '')
+    })).filter((p) => p.name);
+  }
+
+  async function searchMarketPlugins(query, limit = 10) {
+    const list = await readMarketIndex();
+    const q = String(query ?? '').trim().toLowerCase();
+    const max = Math.max(1, Math.min(30, Number(limit) || 10));
+    const hit = q
+      ? list.filter((p) => `${p.name} ${p.title} ${p.description}`.toLowerCase().includes(q))
+      : list;
+    return { total: list.length, matched: hit.length, plugins: hit.slice(0, max) };
+  }
+
+  async function installPluginFromMarket(name) {
+    const wanted = String(name ?? '').trim();
+    if (!wanted) throw new Error('插件名不能为空');
+    const list = await readMarketIndex();
+    const hit = list.find((p) => p.name === wanted);
+    // 只允许市场索引里真实存在的包：不接受任意 npm 名/git 地址（否则等于任意代码执行入口）。
+    if (!hit) throw new Error(`插件市场里没有「${wanted}」（先用 qq_search_plugins 查准确名字）`);
+    const profileDir = path.join(DSH_HOME, 'profiles', String(cfg.socialV2?.adminTools?.profile || 'desktop'));
+    const pkgFile = path.join(profileDir, 'package.json');
+    const pkg = JSON.parse(fs.readFileSync(pkgFile, 'utf8'));
+    if (pkg?.dependencies?.[wanted]) {
+      return { ...hit, already: true, hint: '这个插件已经装过了；如果设置页没出现，重启一次 DSH' };
+    }
+    const pnpm = path.join(DSH_HOME, 'dsh-runtimes', 'dsh-primary-runtime', 'dependencies', 'pnpm', 'bin', 'pnpm.cjs');
+    if (!fs.existsSync(pnpm)) throw new Error(`找不到 DSH 自带的 pnpm：${pnpm}`);
+    const timeout = Math.max(60000, Number(cfg.socialV2?.adminTools?.installTimeoutMs) || 300000);
+    await new Promise((resolve, reject) => {
+      execFile(process.execPath, [pnpm, 'add', wanted, '--dir', profileDir, '--reporter=append-only'], { timeout, windowsHide: true, maxBuffer: 8 * 1024 * 1024 }, (error, stdout, stderr) => {
+        if (error) {
+          reject(new Error(`pnpm add 失败：${String(stderr || stdout || error.message).slice(-400)}`));
+          return;
+        }
+        resolve();
+      });
+    });
+    const nextPkg = JSON.parse(fs.readFileSync(pkgFile, 'utf8'));
+    nextPkg.dsh = nextPkg.dsh ?? {};
+    nextPkg.dsh.profile = nextPkg.dsh.profile ?? {};
+    nextPkg.dsh.profile.bundles = Array.isArray(nextPkg.dsh.profile.bundles) ? nextPkg.dsh.profile.bundles : [];
+    if (!nextPkg.dsh.profile.bundles.includes(wanted)) nextPkg.dsh.profile.bundles.push(wanted);
+    fs.writeFileSync(pkgFile, `${JSON.stringify(nextPkg, null, 2)}\n`, 'utf8');
+    return { ...hit, installed: true, restartRequired: true, hint: '已装好，需要重启 DSH 才会加载' };
   }
 
   // 更新本地 AI 认知（含义/标签/用法/情绪/内容/关键词）。
@@ -6608,7 +6728,10 @@ async function main() {
             getSelfImage: 'qq_get_self_image',
             sendVoice: 'qq_send_voice / qq_list_voices',
             sendImage: 'qq_send_image',
-            sendMeme: 'qq_send_meme'
+            sendMeme: 'qq_send_meme',
+            watchVideo: 'qq_watch_video',
+            searchPlugins: 'qq_search_plugins',
+            installPlugin: 'qq_install_plugin',
           };
           const tools = cfg.socialV2?.tools ?? {};
           const stickerToolFlags = new Set(['listStickers', 'getStickerImage', 'sendSticker', 'setStickerRemark', 'stickerNote', 'collectSticker']);
@@ -8151,6 +8274,68 @@ async function main() {
             sendJson({ ok: false, error: `导入表情失败：${error?.message ?? error}` }, 500);
           }
           return;
+        }
+        // ── 管理员能力（只认 private:<ownerQQ>）────────────────────────────
+        {
+          const adminCfg = cfg.socialV2?.adminTools ?? {};
+          const adminGate = (key, token, flag, label) => {
+            if (adminCfg.enabled === false) return { code: 403, body: { ok: false, code: 'ADMIN_DISABLED', error: '管理员能力已关闭', hint: 'socialV2.adminTools.enabled=true' } };
+            if (!isOwnerSession(key)) return { code: 403, body: { ok: false, code: 'OWNER_ONLY', error: `${label}只对管理员私聊开放`, hint: '在 ownerQQ 的私聊里用' } };
+            if (!token || !agentTokenOk(key, token)) return { code: 403, body: { ok: false, error: 'agent token 无效' } };
+            if (!v2ToolEnabled(flag)) return { code: 403, body: { ok: false, error: `工具未启用：${label}` } };
+            return null;
+          };
+          if (req.method === 'POST' && url.pathname === '/api/socialV2/admin/watch-video') {
+            const body = await readBody();
+            const key = String(body.key ?? '').trim();
+            const gate = adminGate(key, String(body.token ?? req.headers['x-agent-token'] ?? '').trim(), 'watchVideo', '看B站视频');
+            if (gate) { sendJson(gate.body, gate.code); return; }
+            try {
+              const video = await fetchBiliVideoDetail(String(body.bvid ?? body.url ?? '').trim());
+              const comments = await fetchBiliTopComments(video.aid, adminCfg.maxComments ?? 12);
+              let cover = null;
+              if (video.pic) {
+                try {
+                  const img = await safeFetchBuffer(video.pic, 4 * 1024 * 1024);
+                  cover = { mimeType: mimeFromBuffer(img.buffer), data: img.buffer.toString('base64') };
+                } catch (error) { log(`[admin] 视频封面拉取失败：${error?.message ?? error}`); }
+              }
+              appendActivity(`${key} [admin] 看视频 ${video.bvid}「${String(video.title).slice(0, 40)}」`);
+              log(`[admin] 看视频 ${video.bvid}「${String(video.title).slice(0, 40)}」（${comments.length} 条热评）`);
+              sendJson({ ok: true, key, video, comments, ...(cover ? { cover } : {}) });
+            } catch (error) {
+              sendJson({ ok: false, code: 'WATCH_FAILED', error: `看视频失败：${error?.message ?? error}`, hint: '确认 BV 号/链接正确；B站接口偶尔限流，过一会再试' }, 500);
+            }
+            return;
+          }
+          if (req.method === 'GET' && url.pathname === '/api/socialV2/admin/plugin-search') {
+            const key = String(url.searchParams.get('key') ?? '').trim();
+            const gate = adminGate(key, String(req.headers['x-agent-token'] ?? '').trim(), 'searchPlugins', '逛插件市场');
+            if (gate) { sendJson(gate.body, gate.code); return; }
+            try {
+              const out = await searchMarketPlugins(url.searchParams.get('q') ?? '', Number(url.searchParams.get('limit')) || 10);
+              sendJson({ ok: true, key, ...out });
+            } catch (error) {
+              sendJson({ ok: false, code: 'MARKET_FAILED', error: `插件市场拉取失败：${error?.message ?? error}`, hint: '稍后再试；也可以看设置页的插件市场' }, 500);
+            }
+            return;
+          }
+          if (req.method === 'POST' && url.pathname === '/api/socialV2/admin/install-plugin') {
+            const body = await readBody();
+            const key = String(body.key ?? '').trim();
+            const gate = adminGate(key, String(body.token ?? req.headers['x-agent-token'] ?? '').trim(), 'installPlugin', '装插件');
+            if (gate) { sendJson(gate.body, gate.code); return; }
+            const name = String(body.name ?? '').trim();
+            try {
+              const result = await installPluginFromMarket(name);
+              appendActivity(`${key} [admin] 装插件 ${name}${result.already ? '（已装过）' : ''}`);
+              log(`[admin] 装插件 ${name}：${result.already ? '已装过' : '安装成功，等待重启 DSH'}`);
+              sendJson({ ok: true, key, plugin: result });
+            } catch (error) {
+              sendJson({ ok: false, code: 'INSTALL_FAILED', error: `装插件失败：${error?.message ?? error}`, hint: '先用 qq_search_plugins 确认名字；pnpm 失败看设置页插件市场' }, 500);
+            }
+            return;
+          }
         }
         if (req.method === 'POST' && url.pathname === '/api/socialV2/send-meme') {
           const memeCfgRoute = cfg.socialV2?.meme ?? {};
@@ -14267,6 +14452,10 @@ async function main() {
     const memeLine = memeCfgForPrompt.enabled === false || cfg.socialV2?.tools?.sendMeme === false || !memeStats.count
       ? ''
       : `【表情包库】你还有 ${memeStats.count} 张本地表情包（分类：${memeStats.tags.join('/') || 'daily'}）。**气氛合适就主动发**（接梗/吐槽/卖萌/被夸/无语时），不用等对方要求，发图优先于纯文字；对方说正事、干活时就克制。用法：qq_send_meme(tag="happy" 或 query="关键词")，它会直接把图发到当前会话——**不要**自己写“[表情: xxx]”这种标记（QQ 显示不出来）。一次一张、别刷屏；刚发过的那张会自动避开，挑不到就换关键词或换分类。\n\n`;
+    // 管理员能力：只对 private:<ownerQQ> 生效，群里一律拒绝（不要让她在群里宣传这些工具）。
+    const adminToolLine = (cfg.socialV2?.adminTools?.enabled === false || cfg.socialV2?.tools?.watchVideo === false)
+      ? ''
+      : '【管理员能力】只在他私聊里可用：qq_watch_video（bvid/链接，能"看"B站视频：标题/简介/热评+封面图）、qq_search_plugins（逛插件市场）、qq_install_plugin（装市场里的插件，装完要他重启 DSH）。群聊里这些会被拒绝，不要在群里提、也不要在群里用。\n\n';
     const wc = st.wakeConfig || {};
     const wcTr = wc.triggers || {};
     const wcMode = wc.mode === 'active' ? '活跃' : '潜水';
@@ -14298,7 +14487,7 @@ async function main() {
     // 二代不自动注入完整角色卡，但记忆卡必须每轮都在：否则她记不起和主人的事。
     const memoryCardText = memoryCardPromptBlock();
     const memoryCardLine = memoryCardText ? `${memoryCardText}\n\n` : '';
-    const base = roleLine + identityLine + provenanceLine + adminLine + biliLine + memoryCardLine + tokenLine + initialPromptLine + antiAiLine + proactiveLine + closureLine + stickerLine + stickerMatchLine + stickerNudgeLine + imageLine + memeLine + replyLine + statusLine + wakeLine + memoryLine + participationLine + fishGuardLine + tokenGuardLine + preSleepLine;
+    const base = roleLine + identityLine + provenanceLine + adminLine + biliLine + memoryCardLine + tokenLine + initialPromptLine + antiAiLine + proactiveLine + closureLine + stickerLine + stickerMatchLine + stickerNudgeLine + imageLine + memeLine + adminToolLine + replyLine + statusLine + wakeLine + memoryLine + participationLine + fishGuardLine + tokenGuardLine + preSleepLine;
     lastWakePromptMeta = {
       role: roleLine.length,
       identity: identityLine.length,

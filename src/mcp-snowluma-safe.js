@@ -348,6 +348,9 @@ const TOOL_CONFIG_FLAGS = {
   qq_send_sticker: 'sendSticker',
   qq_send_image: 'sendImage',
   qq_send_meme: 'sendMeme',
+  qq_watch_video: 'watchVideo',
+  qq_search_plugins: 'searchPlugins',
+  qq_install_plugin: 'installPlugin',
   qq_import_sticker: 'collectSticker',
   qq_find_stickers: 'findStickers',
   qq_collect_sticker: 'collectSticker',
@@ -1262,6 +1265,93 @@ if (cfg.socialV2?.meme?.enabled !== false && cfg.socialV2?.tools?.sendMeme !== f
         return { content: [{ type: 'text', text: serializeModelData(data) }] };
       } catch (error) {
         return { content: [{ type: 'text', text: `发表情包失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+}
+
+// ── 管理员能力（只认管理员私聊；桥接侧还会再校验一次 OWNER_ONLY）──────
+if (cfg.socialV2?.adminTools?.enabled !== false && cfg.socialV2?.tools?.watchVideo !== false) {
+  server.tool(
+    'qq_watch_video',
+    '“看”一个 B 站视频（只对管理员私聊开放）：返回标题、UP 主、简介、播放/点赞数、热评，并把封面图作为图像返回。用法：传 bvid（BV1xx411c7mD）或整条链接都行。适合管理员让你看视频、点评内容、接梗时用。注意：拿不到视频画面本身（只有封面+简介+热评），别假装看过画面。',
+    {
+      key: z.string().describe('会话 key，必须是 private:<管理员QQ>'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      bvid: z.string().describe('BV 号或 B站视频链接')
+    },
+    async ({ key, token, bvid }) => {
+      try {
+        const data = await agentApi('/api/socialV2/admin/watch-video', {
+          method: 'POST',
+          body: JSON.stringify({ key, token, bvid }),
+          headers: { 'x-agent-token': token },
+          timeoutMs: 60000
+        });
+        const v = data?.video ?? {};
+        const lines = [
+          `【B站视频】${v.title || '(无标题)'}`,
+          `UP：${v.owner || '?'} · 时长 ${Math.round((v.duration || 0) / 60)} 分 · 播放 ${v.stat?.view ?? 0} · 点赞 ${v.stat?.like ?? 0} · 评论 ${v.stat?.reply ?? 0}`,
+          v.desc ? `简介：${v.desc}` : '',
+          "",
+          `热评（${(data?.comments ?? []).length} 条）：`,
+          ...(data?.comments ?? []).map((c, i) => `${i + 1}. [${c.like}赞] ${c.user}：${c.message}`)
+        ].filter(Boolean);
+        const content = [{ type: 'text', text: lines.join('\n') }];
+        if (data?.cover?.data) content.push({ type: 'image', mimeType: data.cover.mimeType || 'image/jpeg', data: data.cover.data });
+        return { content };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `看视频失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+}
+
+if (cfg.socialV2?.adminTools?.enabled !== false && cfg.socialV2?.tools?.searchPlugins !== false) {
+  server.tool(
+    'qq_search_plugins',
+    '逛 DSH 插件市场（只读，只对管理员私聊开放）：按关键词搜插件，返回名字/标题/简介/版本。想装哪个就把准确的 name 交给 qq_install_plugin。',
+    {
+      key: z.string().describe('会话 key，必须是 private:<管理员QQ>'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      query: z.string().optional().describe('搜索词（插件名/描述里包含的字符串），留空则列前 10 个'),
+      limit: z.number().optional().describe('最多返回几条，默认 10，最多 30')
+    },
+    async ({ key, token, query, limit }) => {
+      try {
+        const qs = new URLSearchParams({ key, q: query || '', limit: String(limit ?? 10) });
+        const data = await agentApi(`/api/socialV2/admin/plugin-search?${qs}`, {
+          headers: { 'x-agent-token': token },
+          timeoutMs: 40000
+        });
+        return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `逛插件市场失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+}
+
+if (cfg.socialV2?.adminTools?.enabled !== false && cfg.socialV2?.tools?.installPlugin !== false) {
+  server.tool(
+    'qq_install_plugin',
+    '从 DSH 插件市场安装一个插件（只对管理员私聊开放）。只接受市场索引里真实存在的 name（先用 qq_search_plugins 查准），不接受任意 npm 名或 git 地址。装完会提示需要重启 DSH 才生效；同一插件不会重复装。',
+    {
+      key: z.string().describe('会话 key，必须是 private:<管理员QQ>'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      name: z.string().describe('市场里的插件名（精确值，来自 qq_search_plugins）')
+    },
+    async ({ key, token, name }) => {
+      try {
+        const data = await agentApi('/api/socialV2/admin/install-plugin', {
+          method: 'POST',
+          body: JSON.stringify({ key, token, name }),
+          headers: { 'x-agent-token': token },
+          timeoutMs: 300000
+        });
+        return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `装插件失败：${error?.message ?? error}` }], isError: true };
       }
     }
   );
