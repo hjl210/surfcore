@@ -11076,6 +11076,11 @@ async function main() {
             wakeTimes: Array.isArray(val.wakeTimes) ? val.wakeTimes : [],
             sendTimes: Array.isArray(val.sendTimes) ? val.sendTimes : [],
             stickerCollectTimes: Array.isArray(val.stickerCollectTimes) ? val.stickerCollectTimes : [],
+            // 图库表情 / 出图的用量：必须一起持久化，否则每次桥接重启都「重新开始算」，
+            // 每日上限和「刚发过的不再发」都会在重启后失效。
+            memeRecent: Array.isArray(val.memeRecent) ? val.memeRecent.filter((p) => typeof p === 'string').slice(-30) : [],
+            memeSendTimes: Array.isArray(val.memeSendTimes) ? val.memeSendTimes.map(Number).filter((t) => Number.isFinite(t) && t > 0).slice(-500) : [],
+            imageSendTimes: Array.isArray(val.imageSendTimes) ? val.imageSendTimes.map(Number).filter((t) => Number.isFinite(t) && t > 0).slice(-500) : [],
             pendingWakeTimer: null,
             sleepTimer: null,
             replyCheckTimer: null,
@@ -11201,6 +11206,10 @@ async function main() {
           wakeTimes: st.wakeTimes.slice(-200),
           sendTimes: st.sendTimes.slice(-500),
           stickerCollectTimes: Array.isArray(st.stickerCollectTimes) ? st.stickerCollectTimes.slice(-500) : [],
+          // 图库表情 / 出图的用量与避重列表（见 loadSocialV2State 的同名字段）。
+          memeRecent: Array.isArray(st.memeRecent) ? st.memeRecent.slice(-30) : [],
+          memeSendTimes: Array.isArray(st.memeSendTimes) ? st.memeSendTimes.slice(-500) : [],
+          imageSendTimes: Array.isArray(st.imageSendTimes) ? st.imageSendTimes.slice(-500) : [],
           lastIncomingAt: st.lastIncomingAt || 0,
           lastHistoryMessageTime: st.lastHistoryMessageTime || 0,
           lastHistoryCheckedAt: st.lastHistoryCheckedAt || 0,
