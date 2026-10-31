@@ -15373,6 +15373,82 @@ async function main() {
   }
 
   // QQ 消息 → DSH prompt
+  // 取 QQ 侧对一条语音消息的转写（OneBot 扩展 fetch_ptt_text）。
+  // 拿不到就返回空串——调用方要把它当成“没转写”，不能当成“说了空话”。
+  async function fetchPttText(messageId) {
+    const id = String(messageId ?? '').trim();
+    if (!id) return '';
+    const httpUrl = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
+    try {
+      const res = await fetch(`${httpUrl}/fetch_ptt_text`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          ...(cfg.snowluma?.accessToken ? { authorization: `Bearer ${cfg.snowluma.accessToken}` } : {})
+        },
+        body: JSON.stringify({ message_id: id }),
+        signal: AbortSignal.timeout(15000)
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok || body.status !== 'ok' || body.retcode !== 0) return '';
+      return String(body.data?.text ?? '').trim().slice(0, 600);
+    } catch {
+      return '';
+    }
+  }
+
+  // 本地 ASR 兜底：QQ 不给转写时，用 get_record 取音频 → ffmpeg 转 16k → sherpa-onnx(paraformer) 识别。
+  // 走外部脚本（asr-tools/asr.mjs）而不是把 232MB 模型塞进桥接进程：模型只在子进程里加载，
+  // 崩了只影响这一次转写。
+  async function transcribeRecordByLocalAsr(fileName) {
+    const asrCfg = cfg.socialV2?.voice?.asr ?? {};
+    if (asrCfg.enabled === false) return '';
+    const script = String(asrCfg.script || '').trim();
+    if (!script || !fs.existsSync(script)) return '';
+    const file = String(fileName ?? '').trim();
+    if (!file) return '';
+    const httpUrl = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
+    const workDir = path.join(SURFCORE_DIR, 'voice-in');
+    const stamp = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const rawFile = path.join(workDir, `${stamp}.wav`);
+    const pcmFile = path.join(workDir, `${stamp}-16k.wav`);
+    try {
+      fs.mkdirSync(workDir, { recursive: true });
+      const res = await fetch(`${httpUrl}/get_record`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          ...(cfg.snowluma?.accessToken ? { authorization: `Bearer ${cfg.snowluma.accessToken}` } : {})
+        },
+        body: JSON.stringify({ file, out_format: 'wav' }),
+        signal: AbortSignal.timeout(30000)
+      });
+      const body = await res.json().catch(() => ({}));
+      const b64 = body?.data?.base64;
+      if (!b64) return '';
+      fs.writeFileSync(rawFile, Buffer.from(String(b64), 'base64'));
+      const ffmpeg = String(process.env.FFMPEG_PATH || cfg.socialV2?.voice?.ffmpegPath || 'ffmpeg');
+      await new Promise((resolve, reject) => {
+        execFile(ffmpeg, ['-y', '-loglevel', 'error', '-i', rawFile, '-ar', '16000', '-ac', '1', '-c:a', 'pcm_s16le', pcmFile], { timeout: 30000, windowsHide: true }, (error) => (error ? reject(error) : resolve()));
+      });
+      const out = await new Promise((resolve, reject) => {
+        execFile(process.execPath, [script, pcmFile], { timeout: Math.max(10000, Number(asrCfg.timeoutMs) || 60000), windowsHide: true, maxBuffer: 4 * 1024 * 1024 }, (error, stdout) => {
+          if (error && !stdout) { reject(error); return; }
+          resolve(String(stdout ?? ''));
+        });
+      });
+      let parsed = null;
+      try { parsed = JSON.parse(String(out).trim().split('\n').pop()); } catch {}
+      const text = String(parsed?.text ?? '').trim();
+      return text.slice(0, 600);
+    } catch (error) {
+      log(`[语音] 本地 ASR 失败：${error?.message ?? error}`);
+      return '';
+    } finally {
+      for (const f of [rawFile, pcmFile]) { try { fs.unlinkSync(f); } catch {} }
+    }
+  }
+
   async function handleIncoming(kind, id, event, cfg) {
     const key = convKey(kind, id);
     if (!modeAllowed(key, kind, id, cfg, currentMode)) {
@@ -15394,10 +15470,27 @@ async function main() {
     const resolveReply = (messageId) => resolveReplyInfo(kind, id, messageId, event.self_id);
     // textContent 带引用对象信息，供 DSH 判断“这句话在对谁说”；
     // plainContent 只保留当前消息自己的文字，用于命令/指向性判断，避免被引用原文干扰。
-    const textContent = await segmentsToText(event.message ?? [], { resolveAtName, resolveReply });
-    const plainContent = await segmentsToText(event.message ?? [], { resolveAtName, includeReply: false });
+    let textContent = await segmentsToText(event.message ?? [], { resolveAtName, resolveReply });
+    let plainContent = await segmentsToText(event.message ?? [], { resolveAtName, includeReply: false });
     const mediaList = extractMediaFromSegments(event.message ?? []);
     const messageRef = String(event.message_id ?? event.msg_id ?? event.message_seq ?? '');
+    // 语音消息：QQ 侧有转写（fetch_ptt_text）就附在正文后面，让她真的“听懂”；
+    // 没有转写就明确标注，别让她以为对方发的是空白。
+    if (Array.isArray(event.message) && event.message.some((s) => s && s.type === 'record')
+        && cfg.socialV2?.voice?.transcribeIncoming !== false) {
+      let ptt = await fetchPttText(messageRef);
+      if (!ptt) {
+        // QQ 没给转写 → 本地 ASR（sherpa-onnx + paraformer）
+        const recSeg = (event.message ?? []).find((s) => s && s.type === 'record');
+        ptt = await transcribeRecordByLocalAsr(recSeg?.data?.file);
+      }
+      const tag = ptt ? `（语音转写：${ptt}）` : '（语音消息；没拿到转写）';
+      textContent = `${textContent}${tag}`;
+      plainContent = `${plainContent}${tag}`;
+      log(ptt
+        ? `[语音] ${kind}:${id} 收到语音，转写 ${ptt.length} 字：${ptt.slice(0, 60)}`
+        : `[语音] ${kind}:${id} 收到语音，未拿到转写（message_id=${messageRef}）`);
+    }
     const seqRef = event.message_seq != null ? String(event.message_seq) : '';
     const refsToStore = [...new Set([messageRef, seqRef].filter(Boolean))];
     if (refsToStore.length > 0 && mediaList.length > 0) {
