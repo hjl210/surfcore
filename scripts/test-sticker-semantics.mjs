@@ -208,6 +208,21 @@ test('刚发过的表情会被降权（避免每轮同一张）', () => {
   assert.ok(!punished || punished.score < before.score, '刚发过的必须降分');
 });
 
+test('冷却期内不推荐刚用过的那张（整天重复用同两张 → 换一张）', () => {
+  const entries = fixture();
+  const now = Date.now();
+  const best = rankStickers(entries, '我好委屈啊', { topK: 1, now })[0];
+  assert.ok(best);
+  const target = entries.find((e) => e.no === best.no);
+  target.lastUsedAt = now - 60 * 1000; // 1 分钟前刚发过
+  const after = rankStickers(entries, '我好委屈啊', { topK: 1, now, cooldownMs: 20 * 60 * 1000 });
+  assert.ok(after.length, '还有其他能用的表情，不该返回空');
+  assert.notEqual(after[0].no, best.no, '冷却期内不能又推同一张');
+  // 关掉冷却（cooldownMs=0）时应恢复原样
+  const off = rankStickers(entries, '我好委屈啊', { topK: 1, now, cooldownMs: 0 });
+  assert.ok(off.length);
+});
+
 test('exclude 可以排除指定表情', () => {
   const entries = fixture();
   const ranked = rankStickers(entries, '我好委屈啊', { topK: 3, exclude: ['st-5', 'st-6'] });
@@ -229,7 +244,7 @@ test('没有匹配时返回空串（不占 token）', () => {
   assert.equal(buildStickerMatchHint([], {}), '');
 });
 
-test('高分推荐用强措辞，低分保留保守措辞（模型会自我审查）', () => {
+test('高分推荐用强措辞，低分不否定发送（模型会自我审查）', () => {
   const strong = buildStickerMatchHint([
     { no: 6, emotionLabel: '委屈', content: '哭着求你们别再嘲笑我的回复', score: 0.83 }
   ], {});
@@ -240,7 +255,13 @@ test('高分推荐用强措辞，低分保留保守措辞（模型会自我审�
   const weak = buildStickerMatchHint([
     { no: 5, emotionLabel: '委屈', content: '抱着空碗', score: 0.4 }
   ], {});
-  assert.ok(weak.includes('真的贴合才发一张'), weak);
+  // 2026-10-28 用户反馈「群里不常发表情」：弱匹配以前写「真的贴合才发一张」，
+  // 模型会把这句当成"别发"的依据（只要分不够高就自我审查）。现在改成「贴合就发」，
+  // 但要保留唯一该收手的例外（情绪明显不对），否则会乱发。
+  assert.ok(!weak.includes('真的贴合才发一张'), weak);
+  assert.ok(weak.includes('贴合就发'), weak);
+  assert.ok(weak.includes('情绪明显不对'), '弱匹配仍要保留该收手的例外', weak);
+  assert.ok(!weak.includes('很贴合'), '弱匹配不能说「很贴合」');
 });
 
 console.log('## 编号引用');

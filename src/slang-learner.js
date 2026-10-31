@@ -251,8 +251,40 @@ ${chatLines}
 输出 JSON：`;
 }
 
-export function buildResearchPrompt(candidates) {
-  const list = (candidates || [])
+/**
+ * 网络热梗学习提示词（「网上」通道）。
+ *
+ * 和 buildResearchPrompt 的分工：
+ *   · buildResearchPrompt：给**已知候选**查含义（群聊里出现过的词）；
+ *   · 本函数：主动发现**新词**（近期中文互联网真实在用的梗），不依赖群聊先出现。
+ */
+export function buildWebLearningPrompt({ known = [], want = 6, sourceHint = '' } = {}) {
+  const knownList = (Array.isArray(known) ? known : [])
+    .map((t) => String(t ?? '').trim())
+    .filter(Boolean)
+    .slice(0, 30);
+  const hint = String(sourceHint ?? '').trim();
+  return `你是中文互联网热梗研究员。请用 web_search 搜索**最近 1~2 个月**在中文互联网（微博/抖音/B站/贴吧/知乎/小红书）真实流行、且相对新的网络用语或梗，再用 web_fetch 打开最相关的 1~2 个结果读正文确认（只读搜索/抓取，不要执行任何本地操作）。${hint ? `\n本次重点关注：${escapeLearnerText(hint)}。` : ''}
+${knownList.length ? `\n库/群聊里已经有的词（不要重复收录）：${knownList.map(escapeLearnerText).join('、')}。` : ''}
+
+请输出 JSON 数组（最多 ${Math.max(1, Math.min(10, Number(want) || 6))} 条），每个元素：
+{
+  "content": "词条",
+  "meaning": "含义（简洁准确，基于真实出处）",
+  "usage": "使用场景/语气",
+  "example": "一个自然短句示例",
+  "risk": "敏感/慎用风险（没有就留空）",
+  "sources": ["出处URL"],
+  "confirmed": true
+}
+
+要求：
+- 只要**真实存在、搜得到出处**的词；搜不到、只是普通词、或十年前的老梗（如 yyds）不要输出。
+- 不要编造含义；不能确认的换成别的词，别硬凑。
+- 只输出 JSON 数组。`;
+}
+
+export function buildResearchPrompt(candidates) {  const list = (candidates || [])
     .map((e, i) => {
       const evidence = Array.isArray(e.evidence) && e.evidence.length
         ? e.evidence.slice(-2).map((x) => `（群友语境：${escapeLearnerText(String(x.text || '').slice(0, 80))}）`).join('')

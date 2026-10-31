@@ -486,6 +486,11 @@ export function rankStickers(entries, context, opts = {}) {
   const topK = Math.max(1, Math.min(10, Number(opts.topK) || DEFAULT_TOP_K));
   const minScore = Number.isFinite(Number(opts.minScore)) ? Number(opts.minScore) : DEFAULT_MIN_SCORE;
   const now = Number(opts.now) || Date.now();
+  // 复用冷却：刚发过的同一张在这段时间内不推荐（用户反馈「整天重复用那两张」）。
+  // 0 = 关闭冷却。
+  const cooldownMs = Number.isFinite(Number(opts.cooldownMs))
+    ? Math.max(0, Number(opts.cooldownMs))
+    : 20 * 60 * 1000;
   const exclude = new Set(opts.exclude || []);
   const hits = detectEmotions(text);
   // 把识别出的情绪标签拼进查询文本：说法里没出现「委屈」两个字时也能对上标了委屈的表情
@@ -501,12 +506,15 @@ export function rankStickers(entries, context, opts = {}) {
     const emoScore = emotionSimilarity(entry, hits);
     const kwScore = keywordSimilarity(entry, lowered);
     let score = W_EMOTION * emoScore + W_CONTENT * contentScore + W_KEYWORD * kwScore;
-    // 使用倾向：用过的略优先（真人也是顺手的那张），但上限很小，不能压过语义
-    score += Math.min(0.03, (Number(entry.useCount) || 0) * 0.01);
+    // 使用倾向：用过的略优先（真人也是顺手的那张），但上限很小，不能压过语义。
+    // 没用过的给一点「新鲜度」加分，避免永远是那两张熟脸占位置。
+    const useCount = Number(entry.useCount) || 0;
+    score += useCount > 0 ? Math.min(0.02, useCount * 0.005) : 0.06;
     // 刚发过同一张就降权，避免每轮都是同一张
     const sinceUsed = now - (Number(entry.lastUsedAt) || 0);
-    if (sinceUsed >= 0 && sinceUsed < 15 * 60 * 1000) score -= 0.08;
-    else if (sinceUsed >= 0 && sinceUsed < 60 * 60 * 1000) score -= 0.03;
+    const cooling = cooldownMs > 0 && sinceUsed >= 0 && sinceUsed < cooldownMs;
+    if (cooling) score -= 0.35;
+    else if (sinceUsed >= 0 && sinceUsed < 2 * 60 * 60 * 1000) score -= 0.05;
     score = clamp01(score);
     if (score < minScore) continue;
     const parts = [];
@@ -514,6 +522,7 @@ export function rankStickers(entries, context, opts = {}) {
     if (contentScore >= 0.3) parts.push('内容相近');
     if (kwScore >= 0.5) parts.push('关键词命中');
     ranked.push({
+      cooling,
       no: Number(entry.no) || 0,
       id: entry.id,
       emotion: entry.emotion,
@@ -527,7 +536,10 @@ export function rankStickers(entries, context, opts = {}) {
     });
   }
   ranked.sort((a, b) => b.score - a.score || (a.no || 999) - (b.no || 999));
-  return ranked.slice(0, topK);
+  // 冷却期内的那张只在「别的都不够格」时才兜底出现，否则直接让位给新鲜的。
+  const fresh = ranked.filter((r) => !r.cooling);
+  const pool = fresh.length ? fresh : ranked;
+  return pool.slice(0, topK).map(({ cooling, ...rest }) => rest);
 }
 
 /**
@@ -553,7 +565,7 @@ export function buildStickerMatchHint(ranked, opts = {}) {
   // （日志原话「sending #06 might read as mocking/repeating」）→ 最后只发了文字。
   const tail = strong
     ? `（${topRef} 和当前语境很贴合（${Number(top.score).toFixed(2)}）：发它用 qq_send_sticker stickerId="${topRef}"。接梗、被吐槽/撒娇时发这张本身就自然，不是只有文字才叫回复；严肃/敏感话题、对方真的在生气时才别发。）`
-    : '（真的贴合才发一张：qq_send_sticker stickerId="#编号"；情绪不对就别硬发，也不要每轮都发。）';
+    : '（贴合就发：qq_send_sticker stickerId="#编号"。弱匹配不用追求完美，差一点也能发；只有情绪明显不对（严肃/生气/正事）时才别发。）';
   return [
     `【表情匹配】${mood}本地语义索引最贴合：`,
     ...lines,

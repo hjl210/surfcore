@@ -18,6 +18,7 @@ import { z } from 'zod';
 // 这里 import 只用于「出站审计口径一致」的说明，不在 MCP 内做拦截——
 // 在 MCP 里拦会连「安全拒绝理由」都拿不到，反而让模型无法把话说清楚。
 import { SENSITIVE_RE } from './sensitive.js';
+import { safeFetchBuffer } from './safe-fetch.js';
 import { serializeModelData } from './qq-model-view.js';
 import { EMOTION_LABELS } from './sticker-semantics.js';
 
@@ -345,6 +346,10 @@ const TOOL_CONFIG_FLAGS = {
   qq_list_stickers: 'listStickers',
   qq_get_sticker_image: 'getStickerImage',
   qq_send_sticker: 'sendSticker',
+  qq_send_image: 'sendImage',
+  qq_send_meme: 'sendMeme',
+  qq_import_sticker: 'collectSticker',
+  qq_find_stickers: 'findStickers',
   qq_collect_sticker: 'collectSticker',
   qq_get_self_image: 'getSelfImage',
   qq_sticker_note: 'stickerNote',
@@ -1163,10 +1168,44 @@ if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.sendSticker
   );
 }
 
+if (cfg.socialV2?.image?.enabled !== false && cfg.socialV2?.tools?.sendImage !== false) {
+  server.tool(
+    'qq_send_image',
+    '按文字描述现画一张图片，直接发到指定 QQ 会话（表情包/配图/梗图都行）。prompt 写清画面（主体、风格、构图，中文也可以）；caption 可选，作为同一气泡里配的一句话一起发出去。限制：prompt 最长 600 字；每个会话每天有张数上限（默认 20）；画一张要几秒到几十秒，超时会失败。注意：① 图里的文字/中文字形不保证准确，别承诺"图里写着某某字"；② 一次醒来别连着画很多张，一两张就够；③ 失败时换描述再试一次，仍失败就改回打字，不要假装发过图；④ 只接受文字描述，不能传本地文件路径或 URL。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      prompt: z.string().describe('画面描述：主体 + 风格 + 构图，越具体越稳，最长 600 字'),
+      caption: z.string().optional().describe('可选：同一气泡里配的一句话（最多 200 字）'),
+      replyToMessageId: z.union([z.number(), z.string()]).optional().describe('要引用/回复的消息 id（非零整数，可为负数，可选）'),
+      atUserId: z.union([z.number(), z.string()]).optional().describe('要 @ 的群成员 QQ 号（群聊中可选，私聊不可用）')
+    },
+    async ({ key, token, prompt, caption, replyToMessageId, atUserId }) => {
+      try {
+        const data = await agentApi('/api/socialV2/send-image', {
+          method: 'POST',
+          body: JSON.stringify({
+            key,
+            prompt: String(prompt),
+            caption: caption ? String(caption) : '',
+            replyToMessageId,
+            atUserId: atUserId ?? null
+          }),
+          headers: { 'x-agent-token': token },
+          timeoutMs: 300000
+        });
+        return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `出图失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+}
+
 if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.collectSticker !== false) {
   server.tool(
     'qq_collect_sticker',
-    '收藏当前会话里别人发的一张表情/图片到你的 QQ 收藏表情，并可写一句简短备注（如“好图偷了，兄弟”）。收藏时**顺手标好情绪和内容**：emotion 选最接近的情绪类别，content 写一句图里是什么/什么时候用（如“抱着碗眼泪汪汪，委屈要饭”）。messageId 用 qq_get_unread_messages / qq_get_recent_messages 返回的 messageId 或 seq。注意：不要频繁收藏，只在真的觉得有意思/好用/戳中你时才偷图；收藏后你可以在 qq_list_stickers 里看到并继续使用。',
+    '把当前会话里别人发的一张图片/表情收进你的 QQ 收藏表情（这是你攒表情包最主要的来源，群里看到好玩的图就该收）。收藏时**顺手标好情绪和内容**：emotion 选最接近的情绪类别，content 写一句图里是什么/什么时候用（如"抱着碗眼泪汪汪，委屈要饭"）。messageId 用 qq_get_unread_messages / qq_get_recent_messages 返回的 messageId 或 seq（消息里带 [图片]/[表情] 提示的那种）。别一次收一堆没用的（每个会话有频率上限），但看到「下次自己也想发」的图不收藏就亏了；收藏后可以用 qq_list_stickers 查看、qq_send_sticker 发出去。',
     {
       key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
@@ -1187,6 +1226,152 @@ if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.collectStic
         return { content: [{ type: 'text', text: serializeModelData(data) }] };
       } catch (error) {
         return { content: [{ type: 'text', text: `收藏表情失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+}
+
+if (cfg.socialV2?.meme?.enabled !== false && cfg.socialV2?.tools?.sendMeme !== false) {
+  server.tool(
+    'qq_send_meme',
+    '从本机表情包图库发一张表情包到指定会话（真·图片消息，不是 QQ 收藏表情）。两种找法：① 只给 tag（情绪分类）→ 在该分类里随机挑；② 给 query（关键词）→ 在描述/关键词/图名里搜；两个都给 = 在该分类里按关键词筛，最准。分类：happy 开心(卖萌/可爱/喜欢) / angry 生气 / sad 难过(无语/求饶) / shy 害羞 / confused 困惑惊讶 / daily 日常(睡觉/上班/早上好)。返回会告诉你发了哪张（caption）。注意：一次一张、别刷屏；刚发过的那张会自动避开，挑不到就换关键词或换分类；想配一句话请用 qq_send_message 单独发，别把长文塞进 caption。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      tag: z.string().optional().describe('情绪分类：happy / angry / sad / shy / confused / daily（与 query 至少给一个）'),
+      query: z.string().optional().describe('关键词（中文，空格分隔多个）：按描述/关键词/图名搜，如「猫」「无语」「摸鱼」'),
+      caption: z.string().optional().describe('可选：同一气泡里配的一句话（最多 200 字）'),
+      replyToMessageId: z.union([z.number(), z.string()]).optional().describe('要引用/回复的消息 id（非零整数，可为负数，可选）'),
+      atUserId: z.union([z.number(), z.string()]).optional().describe('要 @ 的群成员 QQ 号（群聊中可选，私聊不可用）')
+    },
+    async ({ key, token, tag, query, caption, replyToMessageId, atUserId }) => {
+      try {
+        const data = await agentApi('/api/socialV2/send-meme', {
+          method: 'POST',
+          body: JSON.stringify({
+            key,
+            tag: tag ? String(tag) : '',
+            query: query ? String(query) : '',
+            caption: caption ? String(caption) : '',
+            replyToMessageId,
+            atUserId: atUserId ?? null
+          }),
+          headers: { 'x-agent-token': token },
+          timeoutMs: 60000
+        });
+        return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `发表情包失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+}
+
+// ── 表情包搜索（Bing 图片搜索，免 key）──────────────────────────────────
+// 只做「找线索」：返回图片直链 + 预览，让她自己决定收哪张。
+// 真正落进 QQ 收藏表情走 qq_import_sticker（桥接里做 SSRF 校验与体积限制）。
+function htmlDecodeEntities(s) {
+  return String(s).replace(/&quot;/g, '"').replace(/&#39;/g, "'")
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+}
+
+async function bingImageSearch(query, count = 6) {
+  const want = Math.max(1, Math.min(12, Number(count) || 6));
+  const q = encodeURIComponent(String(query ?? '').trim().slice(0, 80));
+  if (!q) throw new Error('query 不能为空');
+  const res = await fetch(`https://www.bing.com/images/async?q=${q}&first=1&count=${want * 3}&mkt=zh-CN&adlt=off`, {
+    headers: { 'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36' },
+    signal: AbortSignal.timeout(20000)
+  });
+  if (!res.ok) throw new Error(`图片搜索失败：HTTP ${res.status}`);
+  const html = await res.text();
+  const out = [];
+  for (const m of html.matchAll(/m="([^"]*)"/g)) {
+    let j = null;
+    try { j = JSON.parse(htmlDecodeEntities(m[1])); } catch { continue; }
+    const murl = String(j?.murl ?? '').trim();
+    if (!/^https?:\/\//i.test(murl)) continue;
+    out.push({ url: murl, title: String(j?.t ?? '').slice(0, 80), thumb: String(j?.turl ?? '').trim() });
+    if (out.length >= want) break;
+  }
+  return out;
+}
+
+function sniffMime(buf) {
+  if (buf[0] === 0x89 && buf[1] === 0x50) return 'image/png';
+  if (buf[0] === 0x47) return 'image/gif';
+  if (buf.toString('ascii', 0, 4) === 'RIFF') return 'image/webp';
+  return 'image/jpeg';
+}
+
+if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.findStickers !== false) {
+  server.tool(
+    'qq_find_stickers',
+    '上网搜表情包/梗图（Bing 图片搜索，免 key）。返回若干图片直链 + 前几张的预览图，你自己挑哪张合适；挑中就用 qq_import_sticker 存进 QQ 收藏表情（之后可用 qq_send_sticker 反复发），也可以直接用 qq_send_image 现画一张。用法：query 写具体画面/情绪（如"猫猫 无语 表情包"、"狗头 嘲讽"、"开心 转圈"），别写宽泛的"表情包"。注意：搜到的图不一定会动、也不一定干净；先看预览再收，收错了用 qq_set_sticker_remark 改备注也删不掉，别一次收一堆。',
+    {
+      query: z.string().describe('搜索词：具体画面 + 情绪，如「猫猫 无语 表情包」「狗头 嘲讽」'),
+      count: z.number().optional().describe('返回几张，默认 6，最多 12'),
+      preview: z.boolean().optional().describe('是否附带预览图（默认 true；网络慢时可传 false 只看链接）')
+    },
+    async ({ query, count, preview }) => {
+      try {
+        const items = await bingImageSearch(query, count);
+        if (!items.length) return { content: [{ type: 'text', text: `没搜到「${query}」的图片，换个更具体的说法再试` }] };
+        const lines = items.map((it, i) => `${i + 1}. ${it.title || '(无标题)'}\n   ${it.url}`);
+        const content = [{
+          type: 'text',
+          text: `搜索「${query}」找到 ${items.length} 张图（序号对应下面的预览）。挑中就用 qq_import_sticker(url=..., remark=…) 存进收藏表情：\n${lines.join('\n')}`
+        }];
+        if (preview !== false) {
+          for (let i = 0; i < Math.min(items.length, 4); i += 1) {
+            const it = items[i];
+            if (!it.thumb) continue;
+            try {
+              const got = await safeFetchBuffer(it.thumb, 2 * 1024 * 1024);
+              content.push({ type: 'text', text: `预览 ${i + 1}：` });
+              content.push({ type: 'image', mimeType: sniffMime(got.buffer), data: got.buffer.toString('base64') });
+            } catch {}
+          }
+        }
+        return { content };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `搜图失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+}
+
+if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.collectSticker !== false) {
+  server.tool(
+    'qq_import_sticker',
+    '把一张「网上找的图片直链」存进你的 QQ 收藏表情（自定义表情），之后就能用 qq_send_sticker 反复发。典型用法：qq_find_stickers 搜到合适的图（或别人发的图片链接）→ qq_import_sticker 存下来。只接受 http(s) 图片直链，不接受本地路径。存的时候顺手标好情绪和内容（emotion/content/keywords），以后按语境挑才准。注意别一次存太多，收藏表情会越攒越乱。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      url: z.string().describe('图片直链（http/https，指向 jpg/png/gif/webp）'),
+      remark: z.string().optional().describe('短备注，最多 20 字，例如「无语看手机」'),
+      emotion: z.enum(EMOTION_LABELS).optional().describe('情绪分类：看图判断最接近的一种'),
+      content: z.string().optional().describe('内容描述：一句话说清图里是什么、适合什么场景（最多 120 字）'),
+      keywords: z.array(z.string()).optional().describe('触发关键词，最多 8 个')
+    },
+    async ({ key, token, url, remark, emotion, content, keywords }) => {
+      try {
+        const data = await agentApi('/api/socialV2/import-sticker', {
+          method: 'POST',
+          body: JSON.stringify({
+            key,
+            url: String(url),
+            remark: remark || '',
+            emotion: emotion || '',
+            content: content || '',
+            keywords: keywords || []
+          }),
+          headers: { 'x-agent-token': token },
+          timeoutMs: 120000
+        });
+        return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `导入表情失败：${error?.message ?? error}` }], isError: true };
       }
     }
   );
